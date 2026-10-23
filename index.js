@@ -5,7 +5,6 @@ const path = require('path');
 const fs = require('fs');
 
 const TIMEZONE = 'America/El_Salvador';
-const MAX_TEXTO = 20;
 
 // Ruta de la sesión en el Volume de Railway (/data/whatsapp-session)
 const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'whatsapp-session');
@@ -223,39 +222,22 @@ function textoMenuCriterios() {
 
 client.on('message', async message => {
     try {
-        const texto = message.body.trim().toLowerCase();
+        const texto = message.body ? message.body.trim().toLowerCase() : '';
         const userId = message.author || message.from;
 
         if (message.from === 'status@broadcast') return;
+        if (!texto) return; // Ignora fotos, audios o stickers vacíos
 
         const estado = userStates.get(userId);
 
-        if (texto === '/menu' || texto === '/menú') {
+        // Si el usuario escribe hola (o cualquier variación) o si es su primer mensaje, muestra el menú
+        if (texto === 'hola' || !estado) {
             userStates.set(userId, 'menu_principal');
             await message.reply(textoMenuPrincipal());
             return;
         }
 
-        if (!estado) {
-            userStates.set(userId, 'menu_principal');
-            await message.reply(textoMenuPrincipal());
-            return;
-        }
-
-        if (estado === 'silenciado') return;
-        if (!texto) return;
-
-        if (texto.length > MAX_TEXTO) {
-            userStates.set(userId, 'silenciado');
-            return;
-        }
-
-        if (texto === 'cancelar' || texto === 'salir') {
-            userStates.set(userId, 'silenciado');
-            await message.reply('👋 Listo. Escribe */menu* cuando quieras volver.');
-            return;
-        }
-
+        // Navegación dentro del menú principal
         if (estado === 'menu_principal') {
             if (texto === '1') {
                 userStates.set(userId, 'menu_criterios');
@@ -265,14 +247,17 @@ client.on('message', async message => {
                     `📱 *APP de Equipos Autónomos*\n\n` +
                     `Entra al siguiente link:\n` +
                     `https://fasedeequipos.web.app/\n\n` +
-                    `Envía *1* o *2* para otra opción, o *cancelar* para salir.`
+                    `Envía *1* o *2* para otra opción, o escribe *hola* para volver al menú.`
                 );
             } else {
-                await message.reply('❌ Opción inválida. Envía *1* o *2*, o *cancelar* para salir.');
+                // Cualquier otra palabra o número vuelve a desplegar el menú
+                userStates.set(userId, 'menu_principal');
+                await message.reply(textoMenuPrincipal());
             }
             return;
         }
 
+        // Navegación dentro del menú de criterios
         if (estado === 'menu_criterios') {
             if (texto === '0') {
                 userStates.set(userId, 'menu_principal');
@@ -286,11 +271,12 @@ client.on('message', async message => {
                 await message.reply(
                     `¿Quieres revisar otro?\n\n` +
                     `• Envía otro número (1-8)\n` +
-                    `• Envía *0* para volver al menú principal\n` +
-                    `• Envía *cancelar* para salir`
+                    `• Envía *0* para volver al menú principal`
                 );
             } else {
-                await message.reply('❌ Opción inválida. Envía un número del 1 al 8, o *0* para volver.');
+                // Si escribe cualquier otra cosa no válida dentro de criterios, vuelve al menú principal
+                userStates.set(userId, 'menu_principal');
+                await message.reply(textoMenuPrincipal());
             }
             return;
         }
@@ -300,7 +286,6 @@ client.on('message', async message => {
 });
 
 client.on('qr', qr => {
-    // Genera un link directo a una imagen limpia del QR
     const qrImageUrl = `https://quickchart.io/qr?text=${encodeURIComponent(qr)}&size=300`;
 
     console.log('\n================== CÓDIGO QR WHATSAPP ==================');
