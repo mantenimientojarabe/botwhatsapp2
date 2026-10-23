@@ -207,7 +207,7 @@ function textoMenuPrincipal() {
 
 function textoMenuCriterios() {
     return (
-        `🏆 *CRITERIOS*\n\n` +
+        `🏆 *Catálogo de reconocimiento*\n\n` +
         `¿Qué criterios de embajador quieres revisar el día de hoy?\n\n` +
         `1️⃣ - Embajador de Calidad\n` +
         `2️⃣ - Embajador de Seguridad\n` +
