@@ -11,6 +11,8 @@ const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'whatsapp-
 
 // Estados en memoria por usuario
 const userStates = new Map();
+// Control para evitar procesar dos eventos simultáneos de la misma persona
+const processingUsers = new Set();
 
 // Limpiar locks de Chromium antes de inicializar
 function limpiarLocks(dir) {
@@ -199,13 +201,13 @@ function textoMenuPrincipal() {
         `¿En qué te puedo ayudar?\n\n` +
         `1️⃣ - Catálogo de reconocimientos\n` +
         `2️⃣ - APP de Equipos Autónomos\n\n` +
-        `Envía el número de la opción.`
+        `_Envía el número de la opción deseada._`
     );
 }
 
 function textoMenuCriterios() {
     return (
-        `🏆 *CRITERIOS*\n\n` +
+        `🏆 *Catálogo de reconocimiento*\n\n` +
         `¿Qué criterios de embajador quieres revisar el día de hoy?\n\n` +
         `1️⃣ - Embajador de Calidad\n` +
         `2️⃣ - Embajador de Seguridad\n` +
@@ -215,30 +217,42 @@ function textoMenuCriterios() {
         `6️⃣ - Menciones Honoríficas\n` +
         `7️⃣ - Embajador de Principios\n` +
         `8️⃣ - Dashboard de Liderazgo\n\n` +
-        `Envía el número (1-8).\n` +
-        `Envía *0* para volver al menú principal.`
+        `_Envía un número (1-8) o envía *0* para volver al menú principal._`
     );
 }
 
 client.on('message', async message => {
     try {
+        // 1. Descartar mensajes enviados por el propio bot, estados o broadcasts
+        if (message.fromMe) return;
+        if (message.from === 'status@broadcast') return;
+        if (message.broadcast) return;
+
+        // 2. Solo procesar mensajes de texto estándar
+        if (message.type !== 'chat') return;
+
         const texto = message.body ? message.body.trim().toLowerCase() : '';
+        if (!texto) return;
+
+        // Identificador único (autor si es grupo, o remitente si es chat privado)
         const userId = message.author || message.from;
 
-        if (message.from === 'status@broadcast') return;
-        if (!texto) return; // Ignora fotos, audios o stickers vacíos
+        // 3. Evitar procesamiento concurrente (mensajes duplicados que llegan al mismo milisegundo)
+        if (processingUsers.has(userId)) return;
+        processingUsers.add(userId);
 
-        const estado = userStates.get(userId);
+        const estadoActual = userStates.get(userId);
 
-        // Si el usuario escribe hola (o cualquier variación) o si es su primer mensaje, muestra el menú
-        if (texto === 'hola' || !estado) {
+        // Caso A: Mensaje de reinicio explícito o usuario sin estado previo
+        if (texto === 'hola' || !estadoActual) {
             userStates.set(userId, 'menu_principal');
             await message.reply(textoMenuPrincipal());
+            processingUsers.delete(userId);
             return;
         }
 
-        // Navegación dentro del menú principal
-        if (estado === 'menu_principal') {
+        // Caso B: Está en el Menú Principal
+        if (estadoActual === 'menu_principal') {
             if (texto === '1') {
                 userStates.set(userId, 'menu_criterios');
                 await message.reply(textoMenuCriterios());
@@ -247,41 +261,53 @@ client.on('message', async message => {
                     `📱 *APP de Equipos Autónomos*\n\n` +
                     `Entra al siguiente link:\n` +
                     `https://fasedeequipos.web.app/\n\n` +
-                    `Envía *1* o *2* para otra opción, o escribe *hola* para volver al menú.`
+                    `_Envía *1* para el catálogo o escribe *hola* para volver al menú._`
                 );
             } else {
-                // Cualquier otra palabra o número vuelve a desplegar el menú
-                userStates.set(userId, 'menu_principal');
-                await message.reply(textoMenuPrincipal());
+                // Si envía algo no válido, se le recuerda el menú principal
+                await message.reply(
+                    `❌ Opción no reconocida.\n\n` + textoMenuPrincipal()
+                );
             }
+            processingUsers.delete(userId);
             return;
         }
 
-        // Navegación dentro del menú de criterios
-        if (estado === 'menu_criterios') {
+        // Caso C: Está en el Menú de Criterios
+        if (estadoActual === 'menu_criterios') {
             if (texto === '0') {
                 userStates.set(userId, 'menu_principal');
                 await message.reply(textoMenuPrincipal());
+                processingUsers.delete(userId);
                 return;
             }
 
-            const opcion = parseInt(texto);
+            const opcion = parseInt(texto, 10);
             if (CRITERIOS[opcion] && String(opcion) === texto) {
-                await message.reply(CRITERIOS[opcion]);
-                await message.reply(
-                    `¿Quieres revisar otro?\n\n` +
-                    `• Envía otro número (1-8)\n` +
-                    `• Envía *0* para volver al menú principal`
-                );
+                // Se envía el criterio junto con la instrucción en un solo mensaje para no saturar
+                const respuestaCriterio = 
+                    `${CRITERIOS[opcion]}\n\n` +
+                    `────────────────────\n` +
+                    `¿Quieres revisar otro?\n` +
+                    `• Envía un número (*1-8*)\n` +
+                    `• Envía *0* para volver al menú principal`;
+
+                await message.reply(respuestaCriterio);
             } else {
-                // Si escribe cualquier otra cosa no válida dentro de criterios, vuelve al menú principal
-                userStates.set(userId, 'menu_principal');
-                await message.reply(textoMenuPrincipal());
+                await message.reply(
+                    `❌ Opción no válida.\n\n` + textoMenuCriterios()
+                );
             }
+            processingUsers.delete(userId);
             return;
         }
+
+        processingUsers.delete(userId);
     } catch (error) {
         console.error('❌ Error al manejar mensaje:', error);
+        if (message && (message.author || message.from)) {
+            processingUsers.delete(message.author || message.from);
+        }
     }
 });
 
