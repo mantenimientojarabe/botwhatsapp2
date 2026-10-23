@@ -300,11 +300,13 @@ client.on('message', async message => {
 });
 
 client.on('qr', qr => {
-    console.log('📱 Escanea este QR con WhatsApp (Dispositivos vinculados):\n');
-    qrcode.generate(qr, { small: true });
-    console.log('\n--- CÓDIGO QR EN TEXTO PLANO ---');
-    console.log(qr);
-    console.log('--------------------------------\n');
+    // Genera un link directo a una imagen limpia del QR
+    const qrImageUrl = `https://quickchart.io/qr?text=${encodeURIComponent(qr)}&size=300`;
+
+    console.log('\n================== CÓDIGO QR WHATSAPP ==================');
+    console.log('👉 ABRE ESTE ENLACE EN TU NAVEGADOR PARA ESCANEAR EL QR:');
+    console.log(qrImageUrl);
+    console.log('========================================================\n');
 });
 
 client.on('authenticated', () => console.log('✅ Autenticación exitosa'));
