@@ -207,7 +207,7 @@ function textoMenuPrincipal() {
 
 function textoMenuCriterios() {
     return (
-        `🏆 *Catálogo de reconocimiento*\n\n` +
+        `🏆 *CRITERIOS*\n\n` +
         `¿Qué criterios de embajador quieres revisar el día de hoy?\n\n` +
         `1️⃣ - Embajador de Calidad\n` +
         `2️⃣ - Embajador de Seguridad\n` +
@@ -221,29 +221,50 @@ function textoMenuCriterios() {
     );
 }
 
+// Lista de respuestas sutiles y amables
+const RESPUESTAS_DESPEDIDA = [
+    '¡Con gusto! 😊 Que tengas un excelente día. Si necesitas algo más, aquí estaré.',
+    '¡De nada! 🙌 Un placer ayudarte. Escríbeme cuando quieras.',
+    '¡Para servirte! ✨ Que todo salga muy bien en tu turno.',
+    '¡A la orden! 👍 Saludos y que pases un gran día.'
+];
+
+function obtenerDespedida() {
+    return RESPUESTAS_DESPEDIDA[Math.floor(Math.random() * RESPUESTAS_DESPEDIDA.length)];
+}
+
 client.on('message', async message => {
     try {
-        // 1. Descartar mensajes enviados por el propio bot, estados o broadcasts
+        // Descartar mensajes propios, estados o difusiones
         if (message.fromMe) return;
         if (message.from === 'status@broadcast') return;
         if (message.broadcast) return;
 
-        // 2. Solo procesar mensajes de texto estándar
+        // Solo procesar mensajes de texto
         if (message.type !== 'chat') return;
 
         const texto = message.body ? message.body.trim().toLowerCase() : '';
         if (!texto) return;
 
-        // Identificador único (autor si es grupo, o remitente si es chat privado)
         const userId = message.author || message.from;
 
-        // 3. Evitar procesamiento concurrente (mensajes duplicados que llegan al mismo milisegundo)
+        // Evitar procesar dos peticiones a la vez del mismo usuario
         if (processingUsers.has(userId)) return;
         processingUsers.add(userId);
 
+        // Regex para detectar "gracia", "gracias", repetición de letras (graciaas), con signos o emojis
+        const esAgradecimiento = /gracia+s*/i.test(texto);
+
+        if (esAgradecimiento) {
+            userStates.delete(userId); // Reinicia el estado para que su siguiente mensaje active el menú principal
+            await message.reply(obtenerDespedida());
+            processingUsers.delete(userId);
+            return;
+        }
+
         const estadoActual = userStates.get(userId);
 
-        // Caso A: Mensaje de reinicio explícito o usuario sin estado previo
+        // Primer mensaje o saludo explícito
         if (texto === 'hola' || !estadoActual) {
             userStates.set(userId, 'menu_principal');
             await message.reply(textoMenuPrincipal());
@@ -251,7 +272,7 @@ client.on('message', async message => {
             return;
         }
 
-        // Caso B: Está en el Menú Principal
+        // Menú Principal
         if (estadoActual === 'menu_principal') {
             if (texto === '1') {
                 userStates.set(userId, 'menu_criterios');
@@ -264,7 +285,6 @@ client.on('message', async message => {
                     `_Envía *1* para el catálogo o escribe *hola* para volver al menú._`
                 );
             } else {
-                // Si envía algo no válido, se le recuerda el menú principal
                 await message.reply(
                     `❌ Opción no reconocida.\n\n` + textoMenuPrincipal()
                 );
@@ -273,7 +293,7 @@ client.on('message', async message => {
             return;
         }
 
-        // Caso C: Está en el Menú de Criterios
+        // Menú de Criterios
         if (estadoActual === 'menu_criterios') {
             if (texto === '0') {
                 userStates.set(userId, 'menu_principal');
@@ -284,7 +304,6 @@ client.on('message', async message => {
 
             const opcion = parseInt(texto, 10);
             if (CRITERIOS[opcion] && String(opcion) === texto) {
-                // Se envía el criterio junto con la instrucción en un solo mensaje para no saturar
                 const respuestaCriterio = 
                     `${CRITERIOS[opcion]}\n\n` +
                     `────────────────────\n` +
