@@ -1,4 +1,4 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const moment = require('moment-timezone');
 const path = require('path');
@@ -9,10 +9,26 @@ const TIMEZONE = 'America/El_Salvador';
 // Ruta de la sesión en el Volume de Railway (/data/whatsapp-session)
 const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'whatsapp-session');
 
-// Estados en memoria por usuario
-const userStates = new Map();
-// Control para evitar procesar dos eventos simultáneos de la misma persona
-const processingUsers = new Set();
+// Carpeta donde se guardan las fotos de "Resultado de planta".
+// Por defecto queda al lado de la sesión (ej: /data/resultados-planta) para que también viva en el Volume
+// y no se borre en cada deploy. Dentro hay una carpeta por mes: 2026-10, 2026-11, etc.
+const RESULTADOS_PATH = process.env.RESULTADOS_PATH || path.join(path.dirname(SESSION_PATH), 'resultados-planta');
+
+// Contraseña de "Subir archivos" (se puede cambiar con la variable CLAVE_ARCHIVOS en Railway)
+const CLAVE_ARCHIVOS = process.env.CLAVE_ARCHIVOS || '2003';
+const MAX_INTENTOS_CLAVE = 3;
+// Si el usuario se queda callado este tiempo dentro de "Subir archivos", se le cierra el acceso
+const EXPIRACION_ARCHIVOS_MS = 10 * 60 * 1000;
+// Espera después de la última foto antes de preguntar "¿es la última?" (por si manda varias juntas)
+const ESPERA_CONFIRMACION_MS = 4000;
+
+// Sesión (estado) en memoria por usuario
+const sesiones = new Map();
+// Cola por usuario: los mensajes de una misma persona se procesan uno por uno y en orden
+// (antes se descartaban, pero al subir varias fotos juntas se perderían)
+const colas = new Map();
+// IDs ya procesados, para no responder dos veces al mismo evento
+const mensajesProcesados = new Set();
 
 // Limpiar locks de Chromium antes de inicializar
 function limpiarLocks(dir) {
@@ -32,6 +48,12 @@ function limpiarLocks(dir) {
     }
 }
 limpiarLocks(SESSION_PATH);
+
+try {
+    fs.mkdirSync(RESULTADOS_PATH, { recursive: true });
+} catch (err) {
+    console.warn('⚠️ No se pudo crear la carpeta de resultados:', err.message);
+}
 
 // Configuración del cliente
 const client = new Client({
@@ -200,7 +222,11 @@ function textoMenuPrincipal() {
         `*${obtenerSaludo()}*, soy *Noti Bot* 🤖\n` +
         `¿En qué te puedo ayudar?\n\n` +
         `1️⃣ - Catálogo de reconocimientos\n` +
-        `2️⃣ - APP de Equipos Autónomos\n\n` +
+        `2️⃣ - APP de Equipos Autónomos\n` +
+        `3️⃣ - Número de Stellar\n` +
+        `4️⃣ - Número de People Hub\n` +
+        `5️⃣ - Resultado de planta\n` +
+        `6️⃣ - Subir archivos\n\n` +
         `_Envía el número de la opción deseada._`
     );
 }
@@ -233,101 +259,846 @@ function obtenerDespedida() {
     return RESPUESTAS_DESPEDIDA[Math.floor(Math.random() * RESPUESTAS_DESPEDIDA.length)];
 }
 
-client.on('message', async message => {
+// ═════════════════════════════════════════════
+// Textos de las opciones del menú principal
+// ═════════════════════════════════════════════
+const PIE_MENU = `_Envía otro número del menú (1-6) o escribe *hola* para verlo de nuevo._`;
+
+const TEXTO_APP_EQUIPOS =
+    `📱 *APP de Equipos Autónomos*\n\n` +
+    `Entra al siguiente link:\n` +
+    `https://fasedeequipos.web.app/\n\n` +
+    PIE_MENU;
+
+const TEXTO_STELLAR =
+    `📲 *Número de Stellar*\n\n` +
+    `Tus recibos, constancias y más a un Whats de distancia.\n\n` +
+    `*Puedes solicitar:*\n` +
+    `• Constancia laboral con sueldo fijo\n` +
+    `• Constancia laboral sin sueldo\n` +
+    `• Recibos de nómina\n` +
+    `• Y más...\n\n` +
+    PIE_MENU;
+
+const TEXTO_PEOPLE_HUB =
+    `☎️ *Número de People Hub*\n\n` +
+    `Estos son los números:\n` +
+    `• (503) 2231-5454\n` +
+    `• (502) 25454646\n\n` +
+    PIE_MENU;
+
+const TEXTO_PEDIR_CLAVE =
+    `🔒 *Subir archivos*\n\n` +
+    `Esta opción está protegida.\n` +
+    `Ingresa la *contraseña*:\n\n` +
+    `_Envía *0* para volver al menú principal._`;
+
+const EJEMPLO_MES = `Ejemplo: *octubre 2026* o *10/2026*`;
+
+// ═════════════════════════════════════════════
+// Utilidades de texto y de mes/año
+// ═════════════════════════════════════════════
+const MESES = [
+    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+];
+
+function quitarAcentos(t) {
+    return t.normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
+
+// Minúsculas, sin acentos, sin signos ni emojis
+function normalizar(t) {
+    return quitarAcentos(String(t || '').toLowerCase())
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function plural(n, singular, pluralTxt) {
+    return `${n} ${n === 1 ? singular : pluralTxt}`;
+}
+
+function rango(total) {
+    return total === 1 ? '1' : `1-${total}`;
+}
+
+function indiceMes(palabra) {
+    if (palabra.length < 3) return -1;
+    if (palabra.startsWith('set')) return 8; // "setiembre"
+    return MESES.findIndex(m => m.startsWith(palabra));
+}
+
+function etiquetaDeClave(clave) {
+    const [anio, mes] = clave.split('-').map(Number);
+    const nombre = MESES[mes - 1];
+    return `${nombre.charAt(0).toUpperCase()}${nombre.slice(1)} ${anio}`;
+}
+
+// Acepta: "octubre 2026", "Octubre del 2026", "oct 2026", "10/2026", "10-2026", "10 26", "2026-10"
+// Devuelve { clave: '2026-10', etiqueta: 'Octubre 2026' } o null si no se entiende
+function parsearMesAnio(entrada) {
+    const partes = normalizar(entrada).split(' ').filter(p => p && p !== 'de' && p !== 'del');
+    if (partes.length !== 2) return null;
+
+    let [a, b] = partes;
+    if (/^\d{4}$/.test(a)) [a, b] = [b, a]; // el año vino primero
+
+    const mes = /^\d{1,2}$/.test(a) ? parseInt(a, 10) : indiceMes(a) + 1;
+    if (!/^(\d{2}|\d{4})$/.test(b)) return null;
+    let anio = parseInt(b, 10);
+    if (anio < 100) anio += 2000;
+
+    if (!(mes >= 1 && mes <= 12) || anio < 2000 || anio > 2100) return null;
+
+    const clave = `${anio}-${String(mes).padStart(2, '0')}`;
+    return { clave, etiqueta: etiquetaDeClave(clave) };
+}
+
+// ═════════════════════════════════════════════
+// Utilidades de archivos (fotos por mes)
+// ═════════════════════════════════════════════
+const MIMES_PERMITIDOS = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png' };
+const REGEX_IMAGEN = /^img-(\d+)\.(jpg|jpeg|png)$/i;
+
+function carpetaMes(clave) {
+    return path.join(RESULTADOS_PATH, clave);
+}
+
+function numeroDeArchivo(archivo) {
+    const m = path.basename(archivo).match(REGEX_IMAGEN);
+    return m ? parseInt(m[1], 10) : 0;
+}
+
+// Lista las fotos de un mes, ordenadas como se subieron
+function listarImagenes(clave) {
+    const dir = carpetaMes(clave);
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+        .filter(f => REGEX_IMAGEN.test(f))
+        .sort((x, y) => numeroDeArchivo(x) - numeroDeArchivo(y))
+        .map(f => path.join(dir, f));
+}
+
+function siguienteNumero(clave) {
+    const imgs = listarImagenes(clave);
+    return imgs.length ? numeroDeArchivo(imgs[imgs.length - 1]) + 1 : 1;
+}
+
+async function guardarImagen(clave, foto, numero) {
+    const dir = carpetaMes(clave);
+    await fs.promises.mkdir(dir, { recursive: true });
+    const destino = path.join(dir, `img-${String(numero).padStart(3, '0')}.${MIMES_PERMITIDOS[foto.mimetype]}`);
+    await fs.promises.writeFile(destino, Buffer.from(foto.data, 'base64'));
+    return destino;
+}
+
+async function borrarCarpetaMes(clave) {
+    await fs.promises.rm(carpetaMes(clave), { recursive: true, force: true });
+}
+
+function mesesDisponibles() {
+    if (!fs.existsSync(RESULTADOS_PATH)) return [];
+    return fs.readdirSync(RESULTADOS_PATH)
+        .filter(d => /^\d{4}-\d{2}$/.test(d) && listarImagenes(d).length > 0)
+        .sort()
+        .reverse();
+}
+
+function textoMesesDisponibles() {
+    const meses = mesesDisponibles();
+    if (!meses.length) return `_Aún no hay resultados guardados._`;
+    return `*Meses disponibles:*\n` + meses.slice(0, 12).map(m => `• ${etiquetaDeClave(m)}`).join('\n');
+}
+
+function mimeDeMensaje(message) {
+    return (((message._data && message._data.mimetype) || '').split(';')[0]).toLowerCase();
+}
+
+// Solo fotos: imagen normal o imagen enviada como documento (JPG/PNG)
+function esFoto(message) {
+    if (message.type === 'image') return true;
+    return message.type === 'document' && Boolean(MIMES_PERMITIDOS[mimeDeMensaje(message)]);
+}
+
+async function descargarFoto(message) {
     try {
-        // Descartar mensajes propios, estados o difusiones
-        if (message.fromMe) return;
-        if (message.from === 'status@broadcast') return;
-        if (message.broadcast) return;
-
-        // Solo procesar mensajes de texto
-        if (message.type !== 'chat') return;
-
-        const texto = message.body ? message.body.trim().toLowerCase() : '';
-        if (!texto) return;
-
-        const userId = message.author || message.from;
-
-        // Evitar procesar dos peticiones a la vez del mismo usuario
-        if (processingUsers.has(userId)) return;
-        processingUsers.add(userId);
-
-        // Regex para detectar "gracia", "gracias", repetición de letras (graciaas), con signos o emojis
-        const esAgradecimiento = /gracia+s*/i.test(texto);
-
-        if (esAgradecimiento) {
-            userStates.delete(userId); // Reinicia el estado para que su siguiente mensaje active el menú principal
-            await message.reply(obtenerDespedida());
-            processingUsers.delete(userId);
-            return;
-        }
-
-        const estadoActual = userStates.get(userId);
-
-        // Primer mensaje o saludo explícito
-        if (texto === 'hola' || !estadoActual) {
-            userStates.set(userId, 'menu_principal');
-            await message.reply(textoMenuPrincipal());
-            processingUsers.delete(userId);
-            return;
-        }
-
-        // Menú Principal
-        if (estadoActual === 'menu_principal') {
-            if (texto === '1') {
-                userStates.set(userId, 'menu_criterios');
-                await message.reply(textoMenuCriterios());
-            } else if (texto === '2') {
-                await message.reply(
-                    `📱 *APP de Equipos Autónomos*\n\n` +
-                    `Entra al siguiente link:\n` +
-                    `https://fasedeequipos.web.app/\n\n` +
-                    `_Envía *1* para el catálogo o escribe *hola* para volver al menú._`
-                );
-            } else {
-                await message.reply(
-                    `❌ Opción no reconocida.\n\n` + textoMenuPrincipal()
-                );
-            }
-            processingUsers.delete(userId);
-            return;
-        }
-
-        // Menú de Criterios
-        if (estadoActual === 'menu_criterios') {
-            if (texto === '0') {
-                userStates.set(userId, 'menu_principal');
-                await message.reply(textoMenuPrincipal());
-                processingUsers.delete(userId);
-                return;
-            }
-
-            const opcion = parseInt(texto, 10);
-            if (CRITERIOS[opcion] && String(opcion) === texto) {
-                const respuestaCriterio = 
-                    `${CRITERIOS[opcion]}\n\n` +
-                    `────────────────────\n` +
-                    `¿Quieres revisar otro?\n` +
-                    `• Envía un número (*1-8*)\n` +
-                    `• Envía *0* para volver al menú principal`;
-
-                await message.reply(respuestaCriterio);
-            } else {
-                await message.reply(
-                    `❌ Opción no válida.\n\n` + textoMenuCriterios()
-                );
-            }
-            processingUsers.delete(userId);
-            return;
-        }
-
-        processingUsers.delete(userId);
-    } catch (error) {
-        console.error('❌ Error al manejar mensaje:', error);
-        if (message && (message.author || message.from)) {
-            processingUsers.delete(message.author || message.from);
-        }
+        const media = await message.downloadMedia();
+        if (!media || !media.data) return null;
+        const mimetype = (media.mimetype || '').split(';')[0].toLowerCase();
+        if (!MIMES_PERMITIDOS[mimetype]) return null;
+        return { mimetype, data: media.data };
+    } catch (err) {
+        console.error('❌ Error al descargar imagen:', err.message);
+        return null;
     }
+}
+
+const esperar = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function enviarImagenes(chatId, archivos, crearCaption) {
+    for (let i = 0; i < archivos.length; i++) {
+        const media = MessageMedia.fromFilePath(archivos[i]);
+        await client.sendMessage(chatId, media, { caption: crearCaption(i + 1, archivos.length) });
+        await esperar(700); // pequeña pausa para no saturar WhatsApp
+    }
+}
+
+// ═════════════════════════════════════════════
+// Sesiones y cola por usuario
+// ═════════════════════════════════════════════
+function limpiarTimer(sesion) {
+    if (sesion && sesion.timer) {
+        clearTimeout(sesion.timer);
+        sesion.timer = null;
+    }
+}
+
+function crearSesion(userId, estado) {
+    limpiarTimer(sesiones.get(userId));
+    const sesion = {
+        estado,
+        ultimaActividad: Date.now(),
+        intentosClave: 0,
+        mes: null,             // { clave, etiqueta } del mes con el que se trabaja
+        pendientes: [],        // fotos recibidas que aún no se han guardado
+        volverA: 'arch_menu',  // a dónde regresar al terminar una subida
+        numeroReemplazo: null,
+        timer: null
+    };
+    sesiones.set(userId, sesion);
+    return sesion;
+}
+
+function reiniciarSesion(userId) {
+    limpiarTimer(sesiones.get(userId));
+    sesiones.delete(userId);
+}
+
+function enFlujoArchivos(sesion) {
+    return Boolean(sesion && sesion.estado.startsWith('arch_'));
+}
+
+function encolar(userId, tarea) {
+    const anterior = colas.get(userId) || Promise.resolve();
+    const actual = anterior.then(tarea).catch(err => console.error('❌ Error en la cola:', err));
+    colas.set(userId, actual);
+    actual.then(() => {
+        if (colas.get(userId) === actual) colas.delete(userId);
+    });
+    return actual;
+}
+
+function yaProcesado(id) {
+    if (!id) return false;
+    if (mensajesProcesados.has(id)) return true;
+    mensajesProcesados.add(id);
+    if (mensajesProcesados.size > 1000) {
+        mensajesProcesados.delete(mensajesProcesados.values().next().value);
+    }
+    return false;
+}
+
+// ═════════════════════════════════════════════
+// Menús y navegación
+// ═════════════════════════════════════════════
+function textoMenuArchivos() {
+    return (
+        `📁 *Subir archivos*\n\n` +
+        `¿Qué deseas hacer?\n\n` +
+        `1️⃣ - Subir imágenes de resultados\n` +
+        `2️⃣ - Editar o eliminar imágenes\n\n` +
+        `_Envía *0* para volver al menú principal._`
+    );
+}
+
+function textoMenuEditar(sesion) {
+    const total = listarImagenes(sesion.mes.clave).length;
+    return (
+        `✏️ *Editar ${sesion.mes.etiqueta}* (${plural(total, 'imagen', 'imágenes')})\n\n` +
+        `1️⃣ - Ver las imágenes\n` +
+        `2️⃣ - Agregar más imágenes\n` +
+        `3️⃣ - Reemplazar una imagen\n` +
+        `4️⃣ - Eliminar una o varias imágenes\n` +
+        `5️⃣ - Eliminar todas las imágenes del mes\n\n` +
+        `_Envía *0* para volver al menú de archivos._`
+    );
+}
+
+function textoPedirMesResultado() {
+    return (
+        `📊 *Resultado de planta*\n\n` +
+        `¿De qué *mes y año* quieres consultar los resultados?\n` +
+        `${EJEMPLO_MES}\n\n` +
+        `${textoMesesDisponibles()}\n\n` +
+        `_Envía *0* para volver al menú principal._`
+    );
+}
+
+function textoPreguntaConfirmacion(sesion) {
+    const n = sesion.pendientes.length;
+    return (
+        `📥 Recibí *${plural(n, 'imagen', 'imágenes')}* para *${sesion.mes.etiqueta}*.\n\n` +
+        (n === 1 ? `¿Solo sería esa o enviarás más?\n\n` : `¿Son todas o enviarás más?\n\n`) +
+        `1️⃣ - ${n === 1 ? 'Solo esa' : 'Son todas'}, guardar\n` +
+        `2️⃣ - Enviaré más\n\n` +
+        `_Envía *0* para cancelar sin guardar._`
+    );
+}
+
+async function volverMenuPrincipal(message, userId, prefijo = '') {
+    crearSesion(userId, 'menu_principal');
+    await message.reply(prefijo + textoMenuPrincipal());
+}
+
+async function irAMenuArchivos(message, sesion, prefijo = '') {
+    limpiarTimer(sesion);
+    sesion.pendientes = [];
+    sesion.mes = null;
+    sesion.estado = 'arch_menu';
+    await message.reply(prefijo + textoMenuArchivos());
+}
+
+async function volverMenuEditar(message, sesion, prefijo = '') {
+    if (listarImagenes(sesion.mes.clave).length === 0) {
+        return irAMenuArchivos(message, sesion, prefijo + `Ya no quedan imágenes en *${sesion.mes.etiqueta}*.\n\n`);
+    }
+    sesion.estado = 'arch_editar_menu';
+    await message.reply(prefijo + textoMenuEditar(sesion));
+}
+
+// ═════════════════════════════════════════════
+// Menú principal y catálogo
+// ═════════════════════════════════════════════
+async function manejarMenuPrincipal({ message, sesion, texto }) {
+    switch (texto) {
+        case '1':
+            sesion.estado = 'menu_criterios';
+            return message.reply(textoMenuCriterios());
+        case '2':
+            return message.reply(TEXTO_APP_EQUIPOS);
+        case '3':
+            return message.reply(TEXTO_STELLAR);
+        case '4':
+            return message.reply(TEXTO_PEOPLE_HUB);
+        case '5':
+            sesion.estado = 'resultado_mes';
+            return message.reply(textoPedirMesResultado());
+        case '6':
+            sesion.estado = 'arch_clave';
+            sesion.intentosClave = 0;
+            return message.reply(TEXTO_PEDIR_CLAVE);
+        default:
+            return message.reply(`❌ Opción no reconocida.\n\n` + textoMenuPrincipal());
+    }
+}
+
+async function manejarMenuCriterios({ message, sesion, texto }) {
+    if (texto === '0') {
+        sesion.estado = 'menu_principal';
+        return message.reply(textoMenuPrincipal());
+    }
+
+    const opcion = parseInt(texto, 10);
+    if (CRITERIOS[opcion] && String(opcion) === texto) {
+        const respuestaCriterio =
+            `${CRITERIOS[opcion]}\n\n` +
+            `────────────────────\n` +
+            `¿Quieres revisar otro?\n` +
+            `• Envía un número (*1-8*)\n` +
+            `• Envía *0* para volver al menú principal`;
+
+        return message.reply(respuestaCriterio);
+    }
+    return message.reply(`❌ Opción no válida.\n\n` + textoMenuCriterios());
+}
+
+// ═════════════════════════════════════════════
+// 5️⃣ Resultado de planta (consulta, sin contraseña)
+// ═════════════════════════════════════════════
+async function manejarResultadoMes({ message, sesion, texto }) {
+    if (texto === '0') {
+        sesion.estado = 'menu_principal';
+        return message.reply(textoMenuPrincipal());
+    }
+
+    const mes = parsearMesAnio(texto);
+    if (!mes) {
+        return message.reply(
+            `❌ No reconocí el mes y año.\n${EJEMPLO_MES}\n\n` +
+            `_Envía *0* para volver al menú principal._`
+        );
+    }
+
+    const archivos = listarImagenes(mes.clave);
+    if (!archivos.length) {
+        return message.reply(
+            `😕 Aún no hay resultados de planta para *${mes.etiqueta}*.\n\n` +
+            `${textoMesesDisponibles()}\n\n` +
+            `_Envía otro mes y año o *0* para volver al menú principal._`
+        );
+    }
+
+    await message.reply(
+        `📊 *Resultado de planta — ${mes.etiqueta}*\n` +
+        `Te envío ${archivos.length === 1 ? 'la imagen' : `las ${archivos.length} imágenes`} 👇`
+    );
+    await enviarImagenes(message.from, archivos, (i, n) => (n > 1 ? `${mes.etiqueta} (${i}/${n})` : mes.etiqueta));
+    await client.sendMessage(
+        message.from,
+        `¿Quieres consultar otro mes? Envía el *mes y año* o *0* para volver al menú principal.`
+    );
+}
+
+// ═════════════════════════════════════════════
+// 6️⃣ Subir archivos (con contraseña)
+// ═════════════════════════════════════════════
+async function manejarClave({ message, userId, sesion, texto, textoOriginal }) {
+    if (texto === '0') return volverMenuPrincipal(message, userId);
+
+    if (textoOriginal === CLAVE_ARCHIVOS) {
+        sesion.intentosClave = 0;
+        sesion.estado = 'arch_menu';
+        return message.reply(`✅ Contraseña correcta.\n\n` + textoMenuArchivos());
+    }
+
+    sesion.intentosClave += 1;
+    const restantes = MAX_INTENTOS_CLAVE - sesion.intentosClave;
+    if (restantes <= 0) {
+        return volverMenuPrincipal(message, userId, `❌ Contraseña incorrecta. Se agotaron los intentos.\n\n`);
+    }
+    return message.reply(
+        `❌ Contraseña incorrecta. Te ${restantes === 1 ? 'queda *1* intento' : `quedan *${restantes}* intentos`}.\n\n` +
+        `Ingresa la contraseña o envía *0* para volver al menú principal.`
+    );
+}
+
+async function manejarMenuArchivos({ message, userId, sesion, texto }) {
+    if (texto === '0') return volverMenuPrincipal(message, userId);
+
+    if (texto === '1') {
+        sesion.estado = 'arch_subir_mes';
+        return message.reply(
+            `📤 *Subir imágenes*\n\n` +
+            `¿De qué *mes y año* son las imágenes que vas a subir?\n${EJEMPLO_MES}\n\n` +
+            `_Envía *0* para volver._`
+        );
+    }
+    if (texto === '2') {
+        sesion.estado = 'arch_editar_mes';
+        return message.reply(
+            `✏️ *Editar o eliminar*\n\n` +
+            `¿Qué *mes y año* quieres editar o eliminar?\n${EJEMPLO_MES}\n\n` +
+            `${textoMesesDisponibles()}\n\n` +
+            `_Envía *0* para volver._`
+        );
+    }
+    return message.reply(`❌ Opción no válida.\n\n` + textoMenuArchivos());
+}
+
+// ── Subida de fotos ──────────────────────────
+function iniciarSubida(sesion, mes, volverA) {
+    limpiarTimer(sesion);
+    sesion.mes = mes;
+    sesion.pendientes = [];
+    sesion.volverA = volverA;
+    sesion.estado = 'arch_subir_imagen';
+}
+
+async function terminarSubida(message, sesion, prefijo) {
+    limpiarTimer(sesion);
+    sesion.pendientes = [];
+    if (sesion.volverA === 'arch_editar_menu') return volverMenuEditar(message, sesion, prefijo);
+    return irAMenuArchivos(message, sesion, prefijo);
+}
+
+const RESPUESTAS_ULTIMA = new Set([
+    '1', 'si', 'ya', 'listo', 'guardar', 'guardala', 'guardalas', 'ultima', 'es la ultima', 'ya es la ultima',
+    'solo esa', 'solo esas', 'es la unica', 'solo esa seria', 'son todas', 'ya son todas', 'es todo', 'ya es todo'
+]);
+const RESPUESTAS_MAS = new Set([
+    '2', 'no', 'mas', 'enviare mas', 'voy a enviar mas', 'mandare mas', 'otra', 'otras', 'faltan', 'falta',
+    'no es la ultima', 'no son todas', 'hay mas'
+]);
+
+// Quita palabras de cortesía para entender "sí, gracias", "solo esa por favor", "ok ya es la última", etc.
+function limpiarRespuesta(texto) {
+    return normalizar(texto)
+        .replace(/\b(muchas |mil )?gracia+s*\b/g, ' ')
+        .replace(/\b(por favor|porfa|porfavor|ok|okay|okey|va|dale|bueno|amigo|amiga)\b/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function respuestaEsUltima(texto) {
+    return RESPUESTAS_ULTIMA.has(limpiarRespuesta(texto));
+}
+
+function respuestaEnviaraMas(texto) {
+    return RESPUESTAS_MAS.has(limpiarRespuesta(texto));
+}
+
+// Después de recibir fotos se espera un momento; si no llegan más, se pregunta si es la última
+function programarConfirmacion(userId, chatId, sesion) {
+    limpiarTimer(sesion);
+    sesion.timer = setTimeout(() => {
+        sesion.timer = null;
+        encolar(userId, async () => {
+            if (sesiones.get(userId) !== sesion || sesion.estado !== 'arch_subir_confirmar') return;
+            await client.sendMessage(chatId, textoPreguntaConfirmacion(sesion));
+        });
+    }, ESPERA_CONFIRMACION_MS);
+}
+
+async function guardarPendientes(message, sesion) {
+    limpiarTimer(sesion);
+    const clave = sesion.mes.clave;
+    const cantidad = sesion.pendientes.length;
+    let numero = siguienteNumero(clave);
+    for (const foto of sesion.pendientes) {
+        await guardarImagen(clave, foto, numero++);
+    }
+    const total = listarImagenes(clave).length;
+    console.log(`💾 ${cantidad} imagen(es) guardada(s) en ${clave}`);
+    return terminarSubida(
+        message,
+        sesion,
+        `✅ ¡Listo! Se ${cantidad === 1 ? 'guardó *1 imagen*' : `guardaron *${cantidad} imágenes*`} en *${sesion.mes.etiqueta}*.\n` +
+        `Total en ese mes: *${total}*.\n\n`
+    );
+}
+
+async function cancelarSubida(message, sesion) {
+    const habiaFotos = sesion.pendientes.length > 0;
+    return terminarSubida(
+        message,
+        sesion,
+        habiaFotos ? `🗑️ Subida cancelada, no se guardó nada.\n\n` : `↩️ Subida cancelada.\n\n`
+    );
+}
+
+async function manejarSubirMes({ message, sesion, texto }) {
+    if (texto === '0') return irAMenuArchivos(message, sesion);
+
+    const mes = parsearMesAnio(texto);
+    if (!mes) {
+        return message.reply(`❌ No reconocí el mes y año.\n${EJEMPLO_MES}\n\n_Envía *0* para volver._`);
+    }
+
+    iniciarSubida(sesion, mes, 'arch_menu');
+    const existentes = listarImagenes(mes.clave).length;
+    return message.reply(
+        `📷 Perfecto, *${mes.etiqueta}*.\n` +
+        (existentes
+            ? `Ya hay ${plural(existentes, 'imagen guardada', 'imágenes guardadas')} en ese mes; las nuevas se agregarán.\n`
+            : '') +
+        `\nEnvía la *foto* (solo se permiten imágenes).\n\n` +
+        `_Envía *0* para cancelar._`
+    );
+}
+
+// Texto recibido mientras se espera una foto
+async function manejarSubirImagenTexto({ message, sesion, texto }) {
+    if (texto === '0') return cancelarSubida(message, sesion);
+
+    const n = sesion.pendientes.length;
+    if (n > 0 && respuestaEsUltima(texto)) return guardarPendientes(message, sesion);
+
+    return message.reply(
+        `📷 Estoy esperando una *foto* para *${sesion.mes.etiqueta}*.\n\n` +
+        (n > 0
+            ? `Envía *1* para guardar ${n === 1 ? 'la que ya enviaste' : `las ${n} que ya enviaste`} o *0* para cancelar.`
+            : `Envía la foto o *0* para cancelar.`)
+    );
+}
+
+// Respuesta a "¿Solo sería esa o enviarás más?"
+async function manejarSubirConfirmar({ message, sesion, texto }) {
+    if (texto === '0') return cancelarSubida(message, sesion);
+    if (respuestaEsUltima(texto)) return guardarPendientes(message, sesion);
+
+    limpiarTimer(sesion);
+    if (respuestaEnviaraMas(texto)) {
+        sesion.estado = 'arch_subir_imagen';
+        return message.reply(`👍 Va, envía la siguiente foto.`);
+    }
+    return message.reply(`🤔 No te entendí.\n\n` + textoPreguntaConfirmacion(sesion));
+}
+
+// ── Editar / eliminar ────────────────────────
+async function mostrarImagenesEditar(message, sesion) {
+    const archivos = listarImagenes(sesion.mes.clave);
+    await message.reply(`🖼️ Estas son las imágenes de *${sesion.mes.etiqueta}*:`);
+    await enviarImagenes(message.from, archivos, (i, n) => `Imagen ${i} de ${n}`);
+    await client.sendMessage(message.from, textoMenuEditar(sesion));
+}
+
+async function manejarEditarMes({ message, sesion, texto }) {
+    if (texto === '0') return irAMenuArchivos(message, sesion);
+
+    const mes = parsearMesAnio(texto);
+    if (!mes) {
+        return message.reply(`❌ No reconocí el mes y año.\n${EJEMPLO_MES}\n\n_Envía *0* para volver._`);
+    }
+
+    if (!listarImagenes(mes.clave).length) {
+        return message.reply(
+            `😕 No hay imágenes guardadas en *${mes.etiqueta}*.\n\n` +
+            `${textoMesesDisponibles()}\n\n` +
+            `_Envía otro mes y año o *0* para volver._`
+        );
+    }
+
+    sesion.mes = mes;
+    sesion.estado = 'arch_editar_menu';
+    return mostrarImagenesEditar(message, sesion);
+}
+
+async function manejarEditarMenu({ message, sesion, texto }) {
+    if (texto === '0') return irAMenuArchivos(message, sesion);
+
+    const total = listarImagenes(sesion.mes.clave).length;
+    if (total === 0) {
+        return irAMenuArchivos(message, sesion, `😕 Ya no hay imágenes en *${sesion.mes.etiqueta}*.\n\n`);
+    }
+
+    switch (texto) {
+        case '1':
+            return mostrarImagenesEditar(message, sesion);
+        case '2':
+            iniciarSubida(sesion, sesion.mes, 'arch_editar_menu');
+            return message.reply(
+                `📷 Envía las *fotos* que quieres agregar a *${sesion.mes.etiqueta}*.\n\n_Envía *0* para cancelar._`
+            );
+        case '3':
+            sesion.estado = 'arch_reemplazar_num';
+            return message.reply(
+                `🔁 ¿Qué número de imagen quieres *reemplazar*? (${rango(total)})\n\n_Envía *0* para volver._`
+            );
+        case '4':
+            sesion.estado = 'arch_eliminar_num';
+            return message.reply(
+                `🗑️ ¿Qué número de imagen quieres *eliminar*? (${rango(total)})\n` +
+                `Puedes enviar varios separados por coma, ej: *1,3*\n\n` +
+                `_Envía *0* para volver._`
+            );
+        case '5':
+            sesion.estado = 'arch_eliminar_todo';
+            return message.reply(
+                `⚠️ ¿Seguro que quieres eliminar ${total === 1 ? 'la *única imagen*' : `las *${total} imágenes*`} ` +
+                `de *${sesion.mes.etiqueta}*? Esto no se puede deshacer.\n\n` +
+                `Escribe *SI* para confirmar o *0* para cancelar.`
+            );
+        default:
+            return message.reply(`❌ Opción no válida.\n\n` + textoMenuEditar(sesion));
+    }
+}
+
+async function manejarReemplazarNumero({ message, sesion, texto }) {
+    if (texto === '0') return volverMenuEditar(message, sesion);
+
+    const total = listarImagenes(sesion.mes.clave).length;
+    const n = Number(texto);
+    if (!/^\d+$/.test(texto) || n < 1 || n > total) {
+        return message.reply(`❌ Número no válido. Envía un número del *${rango(total)}* o *0* para volver.`);
+    }
+
+    sesion.numeroReemplazo = n;
+    sesion.estado = 'arch_reemplazar_imagen';
+    return message.reply(`📷 Envía la nueva *foto* que reemplazará la *Imagen ${n}*.\n\n_Envía *0* para cancelar._`);
+}
+
+async function manejarReemplazarImagenTexto({ message, sesion, texto }) {
+    if (texto === '0') return volverMenuEditar(message, sesion, `↩️ No se reemplazó nada.\n\n`);
+    return message.reply(
+        `📷 Estoy esperando la nueva *foto* para la *Imagen ${sesion.numeroReemplazo}*.\n\n` +
+        `Envíala o envía *0* para cancelar.`
+    );
+}
+
+async function manejarEliminarNumeros({ message, sesion, texto }) {
+    if (texto === '0') return volverMenuEditar(message, sesion);
+
+    const archivos = listarImagenes(sesion.mes.clave);
+    const numeros = [...new Set(texto.split(/[^0-9]+/).filter(Boolean).map(Number))].sort((a, b) => a - b);
+    const valido =
+        /^[\d\s,y]+$/.test(texto) && numeros.length > 0 && numeros.every(n => n >= 1 && n <= archivos.length);
+
+    if (!valido) {
+        return message.reply(
+            `❌ Número no válido. Envía números del *${rango(archivos.length)}* (ej: *1,3*) o *0* para volver.`
+        );
+    }
+
+    for (const n of numeros) {
+        await fs.promises.rm(archivos[n - 1], { force: true });
+    }
+    console.log(`🗑️ Eliminadas imágenes ${numeros.join(', ')} de ${sesion.mes.clave}`);
+
+    const resumen = numeros.length === 1
+        ? `✅ Se eliminó la *Imagen ${numeros[0]}*.`
+        : `✅ Se eliminaron las imágenes *${numeros.join(', ')}*.`;
+    const restantes = listarImagenes(sesion.mes.clave).length;
+
+    if (restantes === 0) {
+        await borrarCarpetaMes(sesion.mes.clave);
+        return irAMenuArchivos(message, sesion, `${resumen}\nYa no quedan imágenes en *${sesion.mes.etiqueta}*.\n\n`);
+    }
+    return volverMenuEditar(
+        message,
+        sesion,
+        `${resumen}\nQuedan *${plural(restantes, 'imagen', 'imágenes')}* ` +
+        `(la numeración se actualizó, envía *1* para verlas).\n\n`
+    );
+}
+
+async function manejarEliminarTodo({ message, sesion, texto }) {
+    const t = normalizar(texto);
+    if (t === 'si') {
+        const total = listarImagenes(sesion.mes.clave).length;
+        await borrarCarpetaMes(sesion.mes.clave);
+        console.log(`🗑️ Eliminado el mes completo ${sesion.mes.clave}`);
+        return irAMenuArchivos(
+            message,
+            sesion,
+            `🗑️ Se eliminaron ${plural(total, 'imagen', 'imágenes')} de *${sesion.mes.etiqueta}*.\n\n`
+        );
+    }
+    if (t === '0' || t === 'no') return volverMenuEditar(message, sesion, `↩️ No se eliminó nada.\n\n`);
+    return message.reply(`Escribe *SI* para confirmar o *0* para cancelar.`);
+}
+
+// ── Fotos (u otros archivos) recibidas dentro de "Subir archivos" ──
+const ESTADOS_QUE_ACEPTAN_FOTOS = ['arch_subir_imagen', 'arch_subir_confirmar', 'arch_reemplazar_imagen'];
+
+async function manejarArchivoRecibido(message, userId, sesion) {
+    if (!ESTADOS_QUE_ACEPTAN_FOTOS.includes(sesion.estado)) {
+        return message.reply(
+            `⚠️ En este paso no estoy esperando una imagen.\n` +
+            `Sigue las instrucciones del mensaje anterior o envía *0* para volver.`
+        );
+    }
+
+    if (!esFoto(message)) {
+        return message.reply(`⚠️ Solo se permiten *fotos* (JPG o PNG). Envía una foto, por favor.`);
+    }
+
+    const foto = await descargarFoto(message);
+    if (!foto) {
+        return message.reply(`⚠️ No pude procesar esa imagen. Envíala como *foto* (JPG o PNG) e intenta de nuevo.`);
+    }
+
+    // Reemplazar una imagen existente
+    if (sesion.estado === 'arch_reemplazar_imagen') {
+        const archivos = listarImagenes(sesion.mes.clave);
+        const anterior = archivos[sesion.numeroReemplazo - 1];
+        if (!anterior) return volverMenuEditar(message, sesion, `⚠️ Esa imagen ya no existe.\n\n`);
+
+        const nuevo = await guardarImagen(sesion.mes.clave, foto, numeroDeArchivo(anterior));
+        if (nuevo !== anterior) await fs.promises.rm(anterior, { force: true });
+        console.log(`🔁 Reemplazada imagen ${sesion.numeroReemplazo} de ${sesion.mes.clave}`);
+        return volverMenuEditar(message, sesion, `✅ La *Imagen ${sesion.numeroReemplazo}* fue reemplazada.\n\n`);
+    }
+
+    // Subida normal: se acumula y luego se pregunta si es la última
+    sesion.pendientes.push(foto);
+    sesion.estado = 'arch_subir_confirmar';
+    programarConfirmacion(userId, message.from, sesion);
+}
+
+// ═════════════════════════════════════════════
+// Manejador principal de mensajes
+// ═════════════════════════════════════════════
+const MANEJADORES = {
+    menu_principal: manejarMenuPrincipal,
+    menu_criterios: manejarMenuCriterios,
+    resultado_mes: manejarResultadoMes,
+    arch_clave: manejarClave,
+    arch_menu: manejarMenuArchivos,
+    arch_subir_mes: manejarSubirMes,
+    arch_subir_imagen: manejarSubirImagenTexto,
+    arch_subir_confirmar: manejarSubirConfirmar,
+    arch_editar_mes: manejarEditarMes,
+    arch_editar_menu: manejarEditarMenu,
+    arch_reemplazar_num: manejarReemplazarNumero,
+    arch_reemplazar_imagen: manejarReemplazarImagenTexto,
+    arch_eliminar_num: manejarEliminarNumeros,
+    arch_eliminar_todo: manejarEliminarTodo
+};
+
+async function manejarMensaje(message, userId) {
+    const esTexto = message.type === 'chat';
+    if (!esTexto && !message.hasMedia) return; // reacciones, ubicaciones, etc.
+
+    let sesion = sesiones.get(userId);
+
+    // Cerrar "Subir archivos" si estuvo inactivo mucho tiempo
+    if (enFlujoArchivos(sesion) && Date.now() - sesion.ultimaActividad > EXPIRACION_ARCHIVOS_MS) {
+        const habiaPendientes = sesion.pendientes.length > 0;
+        await volverMenuPrincipal(
+            message,
+            userId,
+            `⏱️ El acceso a *Subir archivos* se cerró por inactividad` +
+            (habiaPendientes ? ` y las imágenes sin confirmar no se guardaron` : '') +
+            `.\n\n`
+        );
+        return;
+    }
+    if (sesion) sesion.ultimaActividad = Date.now();
+
+    // Fotos y otros archivos: solo se usan dentro de "Subir archivos" (fuera de ahí se ignoran, como antes)
+    if (!esTexto) {
+        if (enFlujoArchivos(sesion)) await manejarArchivoRecibido(message, userId, sesion);
+        return;
+    }
+
+    const textoOriginal = message.body ? message.body.trim() : '';
+    const texto = textoOriginal.toLowerCase();
+    if (!texto) return;
+
+    // Regex para detectar "gracia", "gracias", repetición de letras (graciaas), con signos o emojis
+    // (dentro de "Subir archivos" no se usa, para no perder fotos pendientes por un "sí, gracias")
+    const esAgradecimiento = /gracia+s*/i.test(texto);
+    if (esAgradecimiento && !enFlujoArchivos(sesion)) {
+        reiniciarSesion(userId); // su siguiente mensaje vuelve a mostrar el menú principal
+        await message.reply(obtenerDespedida());
+        return;
+    }
+
+    // Primer mensaje o saludo explícito
+    if (texto === 'hola' || !sesion) {
+        await volverMenuPrincipal(message, userId);
+        return;
+    }
+
+    const manejador = MANEJADORES[sesion.estado];
+    if (manejador) {
+        await manejador({ message, userId, sesion, texto, textoOriginal });
+    } else {
+        await volverMenuPrincipal(message, userId);
+    }
+}
+
+client.on('message', message => {
+    // Descartar mensajes propios, estados o difusiones
+    if (message.fromMe) return;
+    if (message.from === 'status@broadcast') return;
+    if (message.broadcast) return;
+    if (yaProcesado(message.id && message.id._serialized)) return;
+
+    const userId = message.author || message.from;
+    encolar(userId, async () => {
+        try {
+            await manejarMensaje(message, userId);
+        } catch (error) {
+            console.error('❌ Error al manejar mensaje:', error);
+            try {
+                await message.reply('⚠️ Ocurrió un error procesando tu mensaje. Intenta de nuevo.');
+            } catch (_) {
+                // si tampoco se puede responder, solo queda el log
+            }
+        }
+    });
 });
 
 client.on('qr', qr => {
@@ -344,6 +1115,7 @@ client.on('auth_failure', msg => console.error('❌ Error de autenticación:', m
 
 client.on('ready', () => {
     console.log(`🤖 Noti Bot listo | ${moment().tz(TIMEZONE).format('DD/MM/YYYY HH:mm:ss')}`);
+    console.log(`📁 Resultados de planta guardados en: ${RESULTADOS_PATH}`);
 });
 
 client.on('disconnected', reason => {
