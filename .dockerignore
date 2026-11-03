@@ -1,5 +1,8 @@
 node_modules
 npm-debug.log
 whatsapp-session
+resultados-planta
+.wwebjs_auth
+.wwebjs_cache
 .git
 .env
