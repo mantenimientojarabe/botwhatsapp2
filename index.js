@@ -284,9 +284,8 @@ const TEXTO_STELLAR =
 
 const TEXTO_PEOPLE_HUB =
     `☎️ *Número de People Hub*\n\n` +
-    `Estos son los números:\n` +
+    `Si deseas hablar con un asistente de people, porfavor llamar al siguiente número:\n` +
     `• (503) 2231-5454\n` +
-    `• (502) 25454646\n\n` +
     PIE_MENU;
 
 const TEXTO_PEDIR_CLAVE =
