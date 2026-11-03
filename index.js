@@ -273,6 +273,8 @@ const TEXTO_APP_EQUIPOS =
 const TEXTO_STELLAR =
     `📲 *Número de Stellar*\n\n` +
     `Tus recibos, constancias y más a un Whats de distancia.\n\n` +
+    `📞 +1 (915) 666-7395\n` +
+    `👉 Escríbeles aquí: https://wa.me/19156667395\n\n` +
     `*Puedes solicitar:*\n` +
     `• Constancia laboral con sueldo fijo\n` +
     `• Constancia laboral sin sueldo\n` +
@@ -1079,14 +1081,28 @@ async function manejarMensaje(message, userId) {
     }
 }
 
+// Muestra solo los últimos 4 dígitos del número en los logs de Railway
+function ocultarNumero(id) {
+    const numero = String(id || '').split('@')[0];
+    return numero.length > 4 ? `…${numero.slice(-4)}` : numero;
+}
+
 client.on('message', message => {
     // Descartar mensajes propios, estados o difusiones
     if (message.fromMe) return;
     if (message.from === 'status@broadcast') return;
     if (message.broadcast) return;
-    if (yaProcesado(message.id && message.id._serialized)) return;
+
+    const id = message.id && (message.id._serialized || message.id.$1);
+    if (yaProcesado(id)) return;
 
     const userId = message.author || message.from;
+    if (!userId) {
+        // Pasa cuando WhatsApp Web cambia algo interno y la versión de whatsapp-web.js quedó vieja
+        console.error('❌ Llegó un mensaje sin remitente: hay que actualizar whatsapp-web.js en package.json');
+        return;
+    }
+    console.log(`📩 Mensaje de ${ocultarNumero(userId)} (${message.type})`);
     encolar(userId, async () => {
         try {
             await manejarMensaje(message, userId);
@@ -1112,6 +1128,8 @@ client.on('qr', qr => {
 
 client.on('authenticated', () => console.log('✅ Autenticación exitosa'));
 client.on('auth_failure', msg => console.error('❌ Error de autenticación:', msg));
+client.on('loading_screen', (porcentaje, mensaje) => console.log(`⏳ Cargando WhatsApp ${porcentaje}% ${mensaje || ''}`));
+client.on('change_state', estado => console.log('🔄 Estado de WhatsApp:', estado));
 
 client.on('ready', () => {
     console.log(`🤖 Noti Bot listo | ${moment().tz(TIMEZONE).format('DD/MM/YYYY HH:mm:ss')}`);
