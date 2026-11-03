@@ -21,6 +21,7 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true
 # Si en Railway ya tienes estas variables, las de Railway mandan.
 ENV SESSION_PATH=/data/whatsapp-session
 ENV RESULTADOS_PATH=/data/resultados-planta
+ENV CUMPLEANEROS_PATH=/data/cumpleaneros
 
 WORKDIR /app
 
