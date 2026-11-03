@@ -16,11 +16,16 @@ RUN apt-get update && apt-get install -y \
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
+# Sesión de WhatsApp y fotos de "Resultado de planta" dentro del Volume de Railway (montado en /data).
+# Si en Railway ya tienes estas variables, las de Railway mandan.
+ENV SESSION_PATH=/data/whatsapp-session
+ENV RESULTADOS_PATH=/data/resultados-planta
+
 WORKDIR /app
 
 # Copiar dependencias e instalarlas
 COPY package*.json ./
-RUN npm install --production
+RUN npm install --omit=dev
 
 # Copiar el código fuente
 COPY . .
