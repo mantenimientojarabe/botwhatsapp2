@@ -13,6 +13,8 @@ const SESSION_PATH = process.env.SESSION_PATH || path.join(__dirname, 'whatsapp-
 // Por defecto queda al lado de la sesión (ej: /data/resultados-planta) para que también viva en el Volume
 // y no se borre en cada deploy. Dentro hay una carpeta por mes: 2026-10, 2026-11, etc.
 const RESULTADOS_PATH = process.env.RESULTADOS_PATH || path.join(path.dirname(SESSION_PATH), 'resultados-planta');
+// Carpeta de las imágenes de "Cumpleañeros". Una carpeta por mes, sin año: 01, 02 ... 12
+const CUMPLEANEROS_PATH = process.env.CUMPLEANEROS_PATH || path.join(path.dirname(SESSION_PATH), 'cumpleaneros');
 
 // Contraseña de "Subir archivos" (se puede cambiar con la variable CLAVE_ARCHIVOS en Railway)
 const CLAVE_ARCHIVOS = process.env.CLAVE_ARCHIVOS || '2003';
@@ -49,10 +51,12 @@ function limpiarLocks(dir) {
 }
 limpiarLocks(SESSION_PATH);
 
-try {
-    fs.mkdirSync(RESULTADOS_PATH, { recursive: true });
-} catch (err) {
-    console.warn('⚠️ No se pudo crear la carpeta de resultados:', err.message);
+for (const carpeta of [RESULTADOS_PATH, CUMPLEANEROS_PATH]) {
+    try {
+        fs.mkdirSync(carpeta, { recursive: true });
+    } catch (err) {
+        console.warn(`⚠️ No se pudo crear la carpeta ${carpeta}:`, err.message);
+    }
 }
 
 // Configuración del cliente
@@ -226,7 +230,8 @@ function textoMenuPrincipal() {
         `3️⃣ - Número de Stellar\n` +
         `4️⃣ - Número de People Hub\n` +
         `5️⃣ - Resultado de planta\n` +
-        `6️⃣ - Subir archivos\n\n` +
+        `6️⃣ - Cumpleañeros\n` +
+        `7️⃣ - Subir archivos\n\n` +
         `_Envía el número de la opción deseada._`
     );
 }
@@ -262,7 +267,7 @@ function obtenerDespedida() {
 // ═════════════════════════════════════════════
 // Textos de las opciones del menú principal
 // ═════════════════════════════════════════════
-const PIE_MENU = `_Envía otro número del menú (1-6) o escribe *hola* para verlo de nuevo._`;
+const PIE_MENU = `_Envía otro número del menú (1-7) o escribe *hola* para verlo de nuevo._`;
 
 const TEXTO_APP_EQUIPOS =
     `📱 *APP de Equipos Autónomos*\n\n` +
@@ -284,8 +289,8 @@ const TEXTO_STELLAR =
 
 const TEXTO_PEOPLE_HUB =
     `☎️ *Número de People Hub*\n\n` +
-    `Si deseas hablar con un asistente de people, porfavor llamar al siguiente número:\n` +
-    `• (503) 2231-5454\n` +
+    `Si deseas hablar con un asistente de People, por favor llamar al siguiente número:\n\n` +
+    `📞 (503) 2231-5454\n\n` +
     PIE_MENU;
 
 const TEXTO_PEDIR_CLAVE =
@@ -294,10 +299,12 @@ const TEXTO_PEDIR_CLAVE =
     `Ingresa la *contraseña*:\n\n` +
     `_Envía *0* para volver al menú principal._`;
 
-const EJEMPLO_MES = `Ejemplo: *octubre 2026* o *10/2026*`;
+const TEXTO_AVISO_CUMPLE =
+    `En caso tu fecha se encuentre equivocada, favor de enviarnos tu fecha correcta. ` +
+    `Agradecemos tu comprensión. 🙏`;
 
 // ═════════════════════════════════════════════
-// Utilidades de texto y de mes/año
+// Utilidades de texto y de meses
 // ═════════════════════════════════════════════
 const MESES = [
     'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
@@ -330,10 +337,18 @@ function indiceMes(palabra) {
     return MESES.findIndex(m => m.startsWith(palabra));
 }
 
-function etiquetaDeClave(clave) {
+function nombreMes(numero) {
+    const nombre = MESES[numero - 1];
+    return `${nombre.charAt(0).toUpperCase()}${nombre.slice(1)}`;
+}
+
+function etiquetaMesAnio(clave) {
     const [anio, mes] = clave.split('-').map(Number);
-    const nombre = MESES[mes - 1];
-    return `${nombre.charAt(0).toUpperCase()}${nombre.slice(1)} ${anio}`;
+    return `${nombreMes(mes)} ${anio}`;
+}
+
+function claveSoloMes(mes) {
+    return String(mes).padStart(2, '0');
 }
 
 // Acepta: "octubre 2026", "Octubre del 2026", "oct 2026", "10/2026", "10-2026", "10 26", "2026-10"
@@ -353,8 +368,65 @@ function parsearMesAnio(entrada) {
     if (!(mes >= 1 && mes <= 12) || anio < 2000 || anio > 2100) return null;
 
     const clave = `${anio}-${String(mes).padStart(2, '0')}`;
-    return { clave, etiqueta: etiquetaDeClave(clave) };
+    return { clave, etiqueta: etiquetaMesAnio(clave) };
 }
+
+// Solo mes (para Cumpleañeros): "noviembre", "nov", "11", "mes 11". Si ponen año, se ignora.
+// Devuelve { clave: '11', etiqueta: 'Noviembre' } o null
+function parsearSoloMes(entrada) {
+    let mes;
+    const conAnio = parsearMesAnio(entrada);
+    if (conAnio) {
+        mes = Number(conAnio.clave.slice(5));
+    } else {
+        const partes = normalizar(entrada).split(' ').filter(p => p && !['de', 'del', 'mes'].includes(p));
+        if (partes.length !== 1) return null;
+        const p = partes[0];
+        mes = /^\d{1,2}$/.test(p) ? parseInt(p, 10) : indiceMes(p) + 1;
+    }
+    if (!(mes >= 1 && mes <= 12)) return null;
+    return { clave: claveSoloMes(mes), etiqueta: nombreMes(mes) };
+}
+
+// Detecta si alguien mandó una fecha (ej: "15 de noviembre", "15/11") para corregir su cumpleaños
+function pareceFecha(texto) {
+    const crudo = quitarAcentos(String(texto || '').toLowerCase());
+    if (/\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\b/.test(crudo)) return true;
+    const palabras = normalizar(texto).split(' ');
+    const tieneMes = palabras.some(p => /^[a-z]{3,}$/.test(p) && indiceMes(p) !== -1);
+    const tieneDia = palabras.some(p => /^\d{1,2}$/.test(p));
+    return tieneMes && tieneDia;
+}
+
+// ═════════════════════════════════════════════
+// Categorías de imágenes
+// ═════════════════════════════════════════════
+const CATEGORIAS = {
+    resultados: {
+        nombre: 'Resultado de planta',
+        emoji: '📊',
+        ruta: RESULTADOS_PATH,
+        regexCarpeta: /^\d{4}-\d{2}$/,
+        masRecientePrimero: true,
+        queMes: '*mes y año*',
+        ejemplo: 'Ejemplo: *octubre 2026* o *10/2026*',
+        parsear: parsearMesAnio,
+        etiqueta: etiquetaMesAnio,
+        titulo: etiqueta => `Resultados de ${etiqueta}`
+    },
+    cumpleaneros: {
+        nombre: 'Cumpleañeros',
+        emoji: '🎂',
+        ruta: CUMPLEANEROS_PATH,
+        regexCarpeta: /^(0[1-9]|1[0-2])$/,
+        masRecientePrimero: false,
+        queMes: '*mes*',
+        ejemplo: 'Ejemplo: *noviembre* o *11*',
+        parsear: parsearSoloMes,
+        etiqueta: clave => nombreMes(Number(clave)),
+        titulo: etiqueta => `Cumpleañeros de ${etiqueta}`
+    }
+};
 
 // ═════════════════════════════════════════════
 // Utilidades de archivos (fotos por mes)
@@ -362,8 +434,8 @@ function parsearMesAnio(entrada) {
 const MIMES_PERMITIDOS = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png' };
 const REGEX_IMAGEN = /^img-(\d+)\.(jpg|jpeg|png)$/i;
 
-function carpetaMes(clave) {
-    return path.join(RESULTADOS_PATH, clave);
+function carpetaMes(cat, clave) {
+    return path.join(cat.ruta, clave);
 }
 
 function numeroDeArchivo(archivo) {
@@ -372,8 +444,8 @@ function numeroDeArchivo(archivo) {
 }
 
 // Lista las fotos de un mes, ordenadas como se subieron
-function listarImagenes(clave) {
-    const dir = carpetaMes(clave);
+function listarImagenes(cat, clave) {
+    const dir = carpetaMes(cat, clave);
     if (!fs.existsSync(dir)) return [];
     return fs.readdirSync(dir)
         .filter(f => REGEX_IMAGEN.test(f))
@@ -381,35 +453,35 @@ function listarImagenes(clave) {
         .map(f => path.join(dir, f));
 }
 
-function siguienteNumero(clave) {
-    const imgs = listarImagenes(clave);
+function siguienteNumero(cat, clave) {
+    const imgs = listarImagenes(cat, clave);
     return imgs.length ? numeroDeArchivo(imgs[imgs.length - 1]) + 1 : 1;
 }
 
-async function guardarImagen(clave, foto, numero) {
-    const dir = carpetaMes(clave);
+async function guardarImagen(cat, clave, foto, numero) {
+    const dir = carpetaMes(cat, clave);
     await fs.promises.mkdir(dir, { recursive: true });
     const destino = path.join(dir, `img-${String(numero).padStart(3, '0')}.${MIMES_PERMITIDOS[foto.mimetype]}`);
     await fs.promises.writeFile(destino, Buffer.from(foto.data, 'base64'));
     return destino;
 }
 
-async function borrarCarpetaMes(clave) {
-    await fs.promises.rm(carpetaMes(clave), { recursive: true, force: true });
+async function borrarCarpetaMes(cat, clave) {
+    await fs.promises.rm(carpetaMes(cat, clave), { recursive: true, force: true });
 }
 
-function mesesDisponibles() {
-    if (!fs.existsSync(RESULTADOS_PATH)) return [];
-    return fs.readdirSync(RESULTADOS_PATH)
-        .filter(d => /^\d{4}-\d{2}$/.test(d) && listarImagenes(d).length > 0)
-        .sort()
-        .reverse();
+function mesesDisponibles(cat) {
+    if (!fs.existsSync(cat.ruta)) return [];
+    const meses = fs.readdirSync(cat.ruta)
+        .filter(d => cat.regexCarpeta.test(d) && listarImagenes(cat, d).length > 0)
+        .sort();
+    return cat.masRecientePrimero ? meses.reverse() : meses;
 }
 
-function textoMesesDisponibles() {
-    const meses = mesesDisponibles();
-    if (!meses.length) return `_Aún no hay resultados guardados._`;
-    return `*Meses disponibles:*\n` + meses.slice(0, 12).map(m => `• ${etiquetaDeClave(m)}`).join('\n');
+function textoMesesDisponibles(cat) {
+    const meses = mesesDisponibles(cat);
+    if (!meses.length) return `_Aún no hay imágenes guardadas._`;
+    return `*Meses disponibles:*\n` + meses.slice(0, 12).map(m => `• ${cat.etiqueta(m)}`).join('\n');
 }
 
 function mimeDeMensaje(message) {
@@ -461,6 +533,7 @@ function crearSesion(userId, estado) {
         estado,
         ultimaActividad: Date.now(),
         intentosClave: 0,
+        categoria: null,       // CATEGORIAS.resultados o CATEGORIAS.cumpleaneros
         mes: null,             // { clave, etiqueta } del mes con el que se trabaja
         pendientes: [],        // fotos recibidas que aún no se han guardado
         volverA: 'arch_menu',  // a dónde regresar al terminar una subida
@@ -478,6 +551,14 @@ function reiniciarSesion(userId) {
 
 function enFlujoArchivos(sesion) {
     return Boolean(sesion && sesion.estado.startsWith('arch_'));
+}
+
+function imagenesDeSesion(sesion) {
+    return listarImagenes(sesion.categoria, sesion.mes.clave);
+}
+
+function tituloDeSesion(sesion) {
+    return sesion.categoria.titulo(sesion.mes.etiqueta);
 }
 
 function encolar(userId, tarea) {
@@ -503,35 +584,67 @@ function yaProcesado(id) {
 // ═════════════════════════════════════════════
 // Menús y navegación
 // ═════════════════════════════════════════════
-function textoMenuArchivos() {
+function textoMenuCategorias() {
     return (
         `📁 *Subir archivos*\n\n` +
-        `¿Qué deseas hacer?\n\n` +
-        `1️⃣ - Subir imágenes de resultados\n` +
-        `2️⃣ - Editar o eliminar imágenes\n\n` +
+        `¿Qué vas a subir o editar?\n\n` +
+        `1️⃣ - ${CATEGORIAS.resultados.emoji} ${CATEGORIAS.resultados.nombre}\n` +
+        `2️⃣ - ${CATEGORIAS.cumpleaneros.emoji} ${CATEGORIAS.cumpleaneros.nombre}\n\n` +
         `_Envía *0* para volver al menú principal._`
     );
 }
 
-function textoMenuEditar(sesion) {
-    const total = listarImagenes(sesion.mes.clave).length;
+function textoMenuArchivos(cat) {
     return (
-        `✏️ *Editar ${sesion.mes.etiqueta}* (${plural(total, 'imagen', 'imágenes')})\n\n` +
+        `${cat.emoji} *${cat.nombre}*\n\n` +
+        `¿Qué deseas hacer?\n\n` +
+        `1️⃣ - Subir imágenes\n` +
+        `2️⃣ - Editar o eliminar imágenes\n\n` +
+        `_Envía *0* para volver._`
+    );
+}
+
+function textoMenuEditar(sesion) {
+    const total = imagenesDeSesion(sesion).length;
+    return (
+        `✏️ *Editar ${tituloDeSesion(sesion)}* (${plural(total, 'imagen', 'imágenes')})\n\n` +
         `1️⃣ - Ver las imágenes\n` +
         `2️⃣ - Agregar más imágenes\n` +
         `3️⃣ - Reemplazar una imagen\n` +
         `4️⃣ - Eliminar una o varias imágenes\n` +
         `5️⃣ - Eliminar todas las imágenes del mes\n\n` +
-        `_Envía *0* para volver al menú de archivos._`
+        `_Envía *0* para volver._`
     );
 }
 
 function textoPedirMesResultado() {
+    const cat = CATEGORIAS.resultados;
     return (
         `📊 *Resultado de planta*\n\n` +
         `¿De qué *mes y año* quieres consultar los resultados?\n` +
-        `${EJEMPLO_MES}\n\n` +
-        `${textoMesesDisponibles()}\n\n` +
+        `${cat.ejemplo}\n\n` +
+        `${textoMesesDisponibles(cat)}\n\n` +
+        `_Envía *0* para volver al menú principal._`
+    );
+}
+
+// Mes actual y mes siguiente según la hora de El Salvador
+function mesesCumple() {
+    const actual = moment().tz(TIMEZONE).month() + 1; // 1-12
+    const siguiente = actual === 12 ? 1 : actual + 1;
+    return {
+        actual: { clave: claveSoloMes(actual), etiqueta: nombreMes(actual) },
+        siguiente: { clave: claveSoloMes(siguiente), etiqueta: nombreMes(siguiente) }
+    };
+}
+
+function textoMenuCumple() {
+    const { actual, siguiente } = mesesCumple();
+    return (
+        `🎂 *Cumpleañeros*\n\n` +
+        `¿Qué mes quieres ver?\n\n` +
+        `1️⃣ - Mes actual (${actual.etiqueta})\n` +
+        `2️⃣ - Mes siguiente (${siguiente.etiqueta})\n\n` +
         `_Envía *0* para volver al menú principal._`
     );
 }
@@ -539,7 +652,7 @@ function textoPedirMesResultado() {
 function textoPreguntaConfirmacion(sesion) {
     const n = sesion.pendientes.length;
     return (
-        `📥 Recibí *${plural(n, 'imagen', 'imágenes')}* para *${sesion.mes.etiqueta}*.\n\n` +
+        `📥 Recibí *${plural(n, 'imagen', 'imágenes')}* para *${tituloDeSesion(sesion)}*.\n\n` +
         (n === 1 ? `¿Solo sería esa o enviarás más?\n\n` : `¿Son todas o enviarás más?\n\n`) +
         `1️⃣ - ${n === 1 ? 'Solo esa' : 'Son todas'}, guardar\n` +
         `2️⃣ - Enviaré más\n\n` +
@@ -552,17 +665,27 @@ async function volverMenuPrincipal(message, userId, prefijo = '') {
     await message.reply(prefijo + textoMenuPrincipal());
 }
 
+async function irAMenuCategorias(message, sesion, prefijo = '') {
+    limpiarTimer(sesion);
+    sesion.pendientes = [];
+    sesion.mes = null;
+    sesion.categoria = null;
+    sesion.estado = 'arch_categoria';
+    await message.reply(prefijo + textoMenuCategorias());
+}
+
+// Menú "Subir / Editar" de la categoría elegida
 async function irAMenuArchivos(message, sesion, prefijo = '') {
     limpiarTimer(sesion);
     sesion.pendientes = [];
     sesion.mes = null;
     sesion.estado = 'arch_menu';
-    await message.reply(prefijo + textoMenuArchivos());
+    await message.reply(prefijo + textoMenuArchivos(sesion.categoria));
 }
 
 async function volverMenuEditar(message, sesion, prefijo = '') {
-    if (listarImagenes(sesion.mes.clave).length === 0) {
-        return irAMenuArchivos(message, sesion, prefijo + `Ya no quedan imágenes en *${sesion.mes.etiqueta}*.\n\n`);
+    if (imagenesDeSesion(sesion).length === 0) {
+        return irAMenuArchivos(message, sesion, prefijo + `Ya no quedan imágenes en *${tituloDeSesion(sesion)}*.\n\n`);
     }
     sesion.estado = 'arch_editar_menu';
     await message.reply(prefijo + textoMenuEditar(sesion));
@@ -586,6 +709,9 @@ async function manejarMenuPrincipal({ message, sesion, texto }) {
             sesion.estado = 'resultado_mes';
             return message.reply(textoPedirMesResultado());
         case '6':
+            sesion.estado = 'cumple_menu';
+            return message.reply(textoMenuCumple());
+        case '7':
             sesion.estado = 'arch_clave';
             sesion.intentosClave = 0;
             return message.reply(TEXTO_PEDIR_CLAVE);
@@ -623,19 +749,20 @@ async function manejarResultadoMes({ message, sesion, texto }) {
         return message.reply(textoMenuPrincipal());
     }
 
-    const mes = parsearMesAnio(texto);
+    const cat = CATEGORIAS.resultados;
+    const mes = cat.parsear(texto);
     if (!mes) {
         return message.reply(
-            `❌ No reconocí el mes y año.\n${EJEMPLO_MES}\n\n` +
+            `❌ No reconocí el mes y año.\n${cat.ejemplo}\n\n` +
             `_Envía *0* para volver al menú principal._`
         );
     }
 
-    const archivos = listarImagenes(mes.clave);
+    const archivos = listarImagenes(cat, mes.clave);
     if (!archivos.length) {
         return message.reply(
             `😕 Aún no hay resultados de planta para *${mes.etiqueta}*.\n\n` +
-            `${textoMesesDisponibles()}\n\n` +
+            `${textoMesesDisponibles(cat)}\n\n` +
             `_Envía otro mes y año o *0* para volver al menú principal._`
         );
     }
@@ -652,15 +779,52 @@ async function manejarResultadoMes({ message, sesion, texto }) {
 }
 
 // ═════════════════════════════════════════════
-// 6️⃣ Subir archivos (con contraseña)
+// 6️⃣ Cumpleañeros (consulta, sin contraseña)
+// ═════════════════════════════════════════════
+async function manejarCumpleMenu({ message, userId, sesion, texto, textoOriginal }) {
+    if (texto === '0') {
+        sesion.estado = 'menu_principal';
+        return message.reply(textoMenuPrincipal());
+    }
+
+    const pieCumple = `_Envía *1* o *2* para ver otro mes, o *0* para volver al menú principal._`;
+
+    if (texto === '1' || texto === '2') {
+        const cat = CATEGORIAS.cumpleaneros;
+        const meses = mesesCumple();
+        const mes = texto === '1' ? meses.actual : meses.siguiente;
+        const archivos = listarImagenes(cat, mes.clave);
+
+        if (!archivos.length) {
+            return message.reply(`😕 Aún no hay cumpleañeros cargados para *${mes.etiqueta}*.\n\n${pieCumple}`);
+        }
+
+        await message.reply(`🎂 *Cumpleañeros de ${mes.etiqueta}* 🎉`);
+        await enviarImagenes(message.from, archivos, (i, n) =>
+            (n > 1 ? `Cumpleañeros de ${mes.etiqueta} (${i}/${n})` : `Cumpleañeros de ${mes.etiqueta}`)
+        );
+        await client.sendMessage(message.from, `${TEXTO_AVISO_CUMPLE}\n\n${pieCumple}`);
+        return;
+    }
+
+    // Alguien mandó su fecha correcta: se agradece y queda en el chat y en los logs
+    if (pareceFecha(textoOriginal)) {
+        console.log(`📝 Corrección de cumpleaños de ${ocultarNumero(userId)}: "${textoOriginal}"`);
+        return message.reply(`📝 ¡Gracias! Recibimos tu fecha y la vamos a revisar.\n\n${pieCumple}`);
+    }
+
+    return message.reply(`❌ Opción no válida.\n\n` + textoMenuCumple());
+}
+
+// ═════════════════════════════════════════════
+// 7️⃣ Subir archivos (con contraseña)
 // ═════════════════════════════════════════════
 async function manejarClave({ message, userId, sesion, texto, textoOriginal }) {
     if (texto === '0') return volverMenuPrincipal(message, userId);
 
     if (textoOriginal === CLAVE_ARCHIVOS) {
         sesion.intentosClave = 0;
-        sesion.estado = 'arch_menu';
-        return message.reply(`✅ Contraseña correcta.\n\n` + textoMenuArchivos());
+        return irAMenuCategorias(message, sesion, `✅ Contraseña correcta.\n\n`);
     }
 
     sesion.intentosClave += 1;
@@ -674,27 +838,42 @@ async function manejarClave({ message, userId, sesion, texto, textoOriginal }) {
     );
 }
 
-async function manejarMenuArchivos({ message, userId, sesion, texto }) {
+// ¿Resultado de planta o Cumpleañeros?
+async function manejarCategoria({ message, userId, sesion, texto }) {
     if (texto === '0') return volverMenuPrincipal(message, userId);
+    if (texto === '1' || texto === '2') {
+        sesion.categoria = texto === '1' ? CATEGORIAS.resultados : CATEGORIAS.cumpleaneros;
+        return irAMenuArchivos(message, sesion);
+    }
+    return message.reply(`❌ Opción no válida.\n\n` + textoMenuCategorias());
+}
 
+async function manejarMenuArchivos({ message, sesion, texto }) {
+    if (texto === '0') return irAMenuCategorias(message, sesion);
+
+    const cat = sesion.categoria;
     if (texto === '1') {
         sesion.estado = 'arch_subir_mes';
         return message.reply(
-            `📤 *Subir imágenes*\n\n` +
-            `¿De qué *mes y año* son las imágenes que vas a subir?\n${EJEMPLO_MES}\n\n` +
+            `📤 *Subir imágenes — ${cat.nombre}*\n\n` +
+            `¿De qué ${cat.queMes} son las imágenes que vas a subir?\n${cat.ejemplo}\n\n` +
             `_Envía *0* para volver._`
         );
     }
     if (texto === '2') {
         sesion.estado = 'arch_editar_mes';
         return message.reply(
-            `✏️ *Editar o eliminar*\n\n` +
-            `¿Qué *mes y año* quieres editar o eliminar?\n${EJEMPLO_MES}\n\n` +
-            `${textoMesesDisponibles()}\n\n` +
+            `✏️ *Editar o eliminar — ${cat.nombre}*\n\n` +
+            `¿Qué ${cat.queMes} quieres editar o eliminar?\n${cat.ejemplo}\n\n` +
+            `${textoMesesDisponibles(cat)}\n\n` +
             `_Envía *0* para volver._`
         );
     }
-    return message.reply(`❌ Opción no válida.\n\n` + textoMenuArchivos());
+    return message.reply(`❌ Opción no válida.\n\n` + textoMenuArchivos(cat));
+}
+
+function textoMesNoReconocido(cat) {
+    return `❌ No reconocí el ${cat.queMes}.\n${cat.ejemplo}\n\n_Envía *0* para volver._`;
 }
 
 // ── Subida de fotos ──────────────────────────
@@ -753,18 +932,19 @@ function programarConfirmacion(userId, chatId, sesion) {
 
 async function guardarPendientes(message, sesion) {
     limpiarTimer(sesion);
+    const cat = sesion.categoria;
     const clave = sesion.mes.clave;
     const cantidad = sesion.pendientes.length;
-    let numero = siguienteNumero(clave);
+    let numero = siguienteNumero(cat, clave);
     for (const foto of sesion.pendientes) {
-        await guardarImagen(clave, foto, numero++);
+        await guardarImagen(cat, clave, foto, numero++);
     }
-    const total = listarImagenes(clave).length;
-    console.log(`💾 ${cantidad} imagen(es) guardada(s) en ${clave}`);
+    const total = listarImagenes(cat, clave).length;
+    console.log(`💾 ${cantidad} imagen(es) guardada(s) en ${cat.nombre} / ${clave}`);
     return terminarSubida(
         message,
         sesion,
-        `✅ ¡Listo! Se ${cantidad === 1 ? 'guardó *1 imagen*' : `guardaron *${cantidad} imágenes*`} en *${sesion.mes.etiqueta}*.\n` +
+        `✅ ¡Listo! Se ${cantidad === 1 ? 'guardó *1 imagen*' : `guardaron *${cantidad} imágenes*`} en *${tituloDeSesion(sesion)}*.\n` +
         `Total en ese mes: *${total}*.\n\n`
     );
 }
@@ -781,18 +961,22 @@ async function cancelarSubida(message, sesion) {
 async function manejarSubirMes({ message, sesion, texto }) {
     if (texto === '0') return irAMenuArchivos(message, sesion);
 
-    const mes = parsearMesAnio(texto);
-    if (!mes) {
-        return message.reply(`❌ No reconocí el mes y año.\n${EJEMPLO_MES}\n\n_Envía *0* para volver._`);
-    }
+    const cat = sesion.categoria;
+    const mes = cat.parsear(texto);
+    if (!mes) return message.reply(textoMesNoReconocido(cat));
 
     iniciarSubida(sesion, mes, 'arch_menu');
-    const existentes = listarImagenes(mes.clave).length;
+    const existentes = imagenesDeSesion(sesion).length;
+    let aviso = '';
+    if (existentes) {
+        aviso = `Ya hay ${plural(existentes, 'imagen guardada', 'imágenes guardadas')} en ese mes; las nuevas se agregarán.\n`;
+        if (cat === CATEGORIAS.cumpleaneros) {
+            aviso += `_Si son del año pasado, puedes borrarlas en *Editar o eliminar*._\n`;
+        }
+    }
     return message.reply(
-        `📷 Perfecto, *${mes.etiqueta}*.\n` +
-        (existentes
-            ? `Ya hay ${plural(existentes, 'imagen guardada', 'imágenes guardadas')} en ese mes; las nuevas se agregarán.\n`
-            : '') +
+        `📷 Perfecto, *${tituloDeSesion(sesion)}*.\n` +
+        aviso +
         `\nEnvía la *foto* (solo se permiten imágenes).\n\n` +
         `_Envía *0* para cancelar._`
     );
@@ -806,7 +990,7 @@ async function manejarSubirImagenTexto({ message, sesion, texto }) {
     if (n > 0 && respuestaEsUltima(texto)) return guardarPendientes(message, sesion);
 
     return message.reply(
-        `📷 Estoy esperando una *foto* para *${sesion.mes.etiqueta}*.\n\n` +
+        `📷 Estoy esperando una *foto* para *${tituloDeSesion(sesion)}*.\n\n` +
         (n > 0
             ? `Envía *1* para guardar ${n === 1 ? 'la que ya enviaste' : `las ${n} que ya enviaste`} o *0* para cancelar.`
             : `Envía la foto o *0* para cancelar.`)
@@ -828,8 +1012,8 @@ async function manejarSubirConfirmar({ message, sesion, texto }) {
 
 // ── Editar / eliminar ────────────────────────
 async function mostrarImagenesEditar(message, sesion) {
-    const archivos = listarImagenes(sesion.mes.clave);
-    await message.reply(`🖼️ Estas son las imágenes de *${sesion.mes.etiqueta}*:`);
+    const archivos = imagenesDeSesion(sesion);
+    await message.reply(`🖼️ Estas son las imágenes de *${tituloDeSesion(sesion)}*:`);
     await enviarImagenes(message.from, archivos, (i, n) => `Imagen ${i} de ${n}`);
     await client.sendMessage(message.from, textoMenuEditar(sesion));
 }
@@ -837,16 +1021,15 @@ async function mostrarImagenesEditar(message, sesion) {
 async function manejarEditarMes({ message, sesion, texto }) {
     if (texto === '0') return irAMenuArchivos(message, sesion);
 
-    const mes = parsearMesAnio(texto);
-    if (!mes) {
-        return message.reply(`❌ No reconocí el mes y año.\n${EJEMPLO_MES}\n\n_Envía *0* para volver._`);
-    }
+    const cat = sesion.categoria;
+    const mes = cat.parsear(texto);
+    if (!mes) return message.reply(textoMesNoReconocido(cat));
 
-    if (!listarImagenes(mes.clave).length) {
+    if (!listarImagenes(cat, mes.clave).length) {
         return message.reply(
-            `😕 No hay imágenes guardadas en *${mes.etiqueta}*.\n\n` +
-            `${textoMesesDisponibles()}\n\n` +
-            `_Envía otro mes y año o *0* para volver._`
+            `😕 No hay imágenes guardadas en *${cat.titulo(mes.etiqueta)}*.\n\n` +
+            `${textoMesesDisponibles(cat)}\n\n` +
+            `_Envía otro ${cat.queMes} o *0* para volver._`
         );
     }
 
@@ -858,9 +1041,9 @@ async function manejarEditarMes({ message, sesion, texto }) {
 async function manejarEditarMenu({ message, sesion, texto }) {
     if (texto === '0') return irAMenuArchivos(message, sesion);
 
-    const total = listarImagenes(sesion.mes.clave).length;
+    const total = imagenesDeSesion(sesion).length;
     if (total === 0) {
-        return irAMenuArchivos(message, sesion, `😕 Ya no hay imágenes en *${sesion.mes.etiqueta}*.\n\n`);
+        return irAMenuArchivos(message, sesion, `😕 Ya no hay imágenes en *${tituloDeSesion(sesion)}*.\n\n`);
     }
 
     switch (texto) {
@@ -869,7 +1052,7 @@ async function manejarEditarMenu({ message, sesion, texto }) {
         case '2':
             iniciarSubida(sesion, sesion.mes, 'arch_editar_menu');
             return message.reply(
-                `📷 Envía las *fotos* que quieres agregar a *${sesion.mes.etiqueta}*.\n\n_Envía *0* para cancelar._`
+                `📷 Envía las *fotos* que quieres agregar a *${tituloDeSesion(sesion)}*.\n\n_Envía *0* para cancelar._`
             );
         case '3':
             sesion.estado = 'arch_reemplazar_num';
@@ -887,7 +1070,7 @@ async function manejarEditarMenu({ message, sesion, texto }) {
             sesion.estado = 'arch_eliminar_todo';
             return message.reply(
                 `⚠️ ¿Seguro que quieres eliminar ${total === 1 ? 'la *única imagen*' : `las *${total} imágenes*`} ` +
-                `de *${sesion.mes.etiqueta}*? Esto no se puede deshacer.\n\n` +
+                `de *${tituloDeSesion(sesion)}*? Esto no se puede deshacer.\n\n` +
                 `Escribe *SI* para confirmar o *0* para cancelar.`
             );
         default:
@@ -898,7 +1081,7 @@ async function manejarEditarMenu({ message, sesion, texto }) {
 async function manejarReemplazarNumero({ message, sesion, texto }) {
     if (texto === '0') return volverMenuEditar(message, sesion);
 
-    const total = listarImagenes(sesion.mes.clave).length;
+    const total = imagenesDeSesion(sesion).length;
     const n = Number(texto);
     if (!/^\d+$/.test(texto) || n < 1 || n > total) {
         return message.reply(`❌ Número no válido. Envía un número del *${rango(total)}* o *0* para volver.`);
@@ -920,7 +1103,7 @@ async function manejarReemplazarImagenTexto({ message, sesion, texto }) {
 async function manejarEliminarNumeros({ message, sesion, texto }) {
     if (texto === '0') return volverMenuEditar(message, sesion);
 
-    const archivos = listarImagenes(sesion.mes.clave);
+    const archivos = imagenesDeSesion(sesion);
     const numeros = [...new Set(texto.split(/[^0-9]+/).filter(Boolean).map(Number))].sort((a, b) => a - b);
     const valido =
         /^[\d\s,y]+$/.test(texto) && numeros.length > 0 && numeros.every(n => n >= 1 && n <= archivos.length);
@@ -934,16 +1117,17 @@ async function manejarEliminarNumeros({ message, sesion, texto }) {
     for (const n of numeros) {
         await fs.promises.rm(archivos[n - 1], { force: true });
     }
-    console.log(`🗑️ Eliminadas imágenes ${numeros.join(', ')} de ${sesion.mes.clave}`);
+    console.log(`🗑️ Eliminadas imágenes ${numeros.join(', ')} de ${sesion.categoria.nombre} / ${sesion.mes.clave}`);
 
     const resumen = numeros.length === 1
         ? `✅ Se eliminó la *Imagen ${numeros[0]}*.`
         : `✅ Se eliminaron las imágenes *${numeros.join(', ')}*.`;
-    const restantes = listarImagenes(sesion.mes.clave).length;
+    const restantes = imagenesDeSesion(sesion).length;
 
     if (restantes === 0) {
-        await borrarCarpetaMes(sesion.mes.clave);
-        return irAMenuArchivos(message, sesion, `${resumen}\nYa no quedan imágenes en *${sesion.mes.etiqueta}*.\n\n`);
+        const titulo = tituloDeSesion(sesion);
+        await borrarCarpetaMes(sesion.categoria, sesion.mes.clave);
+        return irAMenuArchivos(message, sesion, `${resumen}\nYa no quedan imágenes en *${titulo}*.\n\n`);
     }
     return volverMenuEditar(
         message,
@@ -956,14 +1140,11 @@ async function manejarEliminarNumeros({ message, sesion, texto }) {
 async function manejarEliminarTodo({ message, sesion, texto }) {
     const t = normalizar(texto);
     if (t === 'si') {
-        const total = listarImagenes(sesion.mes.clave).length;
-        await borrarCarpetaMes(sesion.mes.clave);
-        console.log(`🗑️ Eliminado el mes completo ${sesion.mes.clave}`);
-        return irAMenuArchivos(
-            message,
-            sesion,
-            `🗑️ Se eliminaron ${plural(total, 'imagen', 'imágenes')} de *${sesion.mes.etiqueta}*.\n\n`
-        );
+        const total = imagenesDeSesion(sesion).length;
+        const titulo = tituloDeSesion(sesion);
+        await borrarCarpetaMes(sesion.categoria, sesion.mes.clave);
+        console.log(`🗑️ Eliminado el mes completo ${sesion.categoria.nombre} / ${sesion.mes.clave}`);
+        return irAMenuArchivos(message, sesion, `🗑️ Se eliminaron ${plural(total, 'imagen', 'imágenes')} de *${titulo}*.\n\n`);
     }
     if (t === '0' || t === 'no') return volverMenuEditar(message, sesion, `↩️ No se eliminó nada.\n\n`);
     return message.reply(`Escribe *SI* para confirmar o *0* para cancelar.`);
@@ -991,13 +1172,13 @@ async function manejarArchivoRecibido(message, userId, sesion) {
 
     // Reemplazar una imagen existente
     if (sesion.estado === 'arch_reemplazar_imagen') {
-        const archivos = listarImagenes(sesion.mes.clave);
+        const archivos = imagenesDeSesion(sesion);
         const anterior = archivos[sesion.numeroReemplazo - 1];
         if (!anterior) return volverMenuEditar(message, sesion, `⚠️ Esa imagen ya no existe.\n\n`);
 
-        const nuevo = await guardarImagen(sesion.mes.clave, foto, numeroDeArchivo(anterior));
+        const nuevo = await guardarImagen(sesion.categoria, sesion.mes.clave, foto, numeroDeArchivo(anterior));
         if (nuevo !== anterior) await fs.promises.rm(anterior, { force: true });
-        console.log(`🔁 Reemplazada imagen ${sesion.numeroReemplazo} de ${sesion.mes.clave}`);
+        console.log(`🔁 Reemplazada imagen ${sesion.numeroReemplazo} de ${sesion.categoria.nombre} / ${sesion.mes.clave}`);
         return volverMenuEditar(message, sesion, `✅ La *Imagen ${sesion.numeroReemplazo}* fue reemplazada.\n\n`);
     }
 
@@ -1014,7 +1195,9 @@ const MANEJADORES = {
     menu_principal: manejarMenuPrincipal,
     menu_criterios: manejarMenuCriterios,
     resultado_mes: manejarResultadoMes,
+    cumple_menu: manejarCumpleMenu,
     arch_clave: manejarClave,
+    arch_categoria: manejarCategoria,
     arch_menu: manejarMenuArchivos,
     arch_subir_mes: manejarSubirMes,
     arch_subir_imagen: manejarSubirImagenTexto,
@@ -1102,6 +1285,7 @@ client.on('message', message => {
         return;
     }
     console.log(`📩 Mensaje de ${ocultarNumero(userId)} (${message.type})`);
+
     encolar(userId, async () => {
         try {
             await manejarMensaje(message, userId);
@@ -1133,6 +1317,7 @@ client.on('change_state', estado => console.log('🔄 Estado de WhatsApp:', esta
 client.on('ready', () => {
     console.log(`🤖 Noti Bot listo | ${moment().tz(TIMEZONE).format('DD/MM/YYYY HH:mm:ss')}`);
     console.log(`📁 Resultados de planta guardados en: ${RESULTADOS_PATH}`);
+    console.log(`🎂 Cumpleañeros guardados en: ${CUMPLEANEROS_PATH}`);
 });
 
 client.on('disconnected', reason => {
